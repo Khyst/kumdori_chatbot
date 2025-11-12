@@ -71,12 +71,49 @@ def categorize_llm_chain():
 
 def region_llm_chain():
     
+    # 한국 지역 데이터 헬퍼 인스턴스 생성
+    regions_helper = korea_regions_helper()
+    
+    # 유효한 지역명 목록 가져오기
+    valid_provinces = regions_helper.get_valid_provinces()
+    
+    # 프롬프트에 유효한 지역명 정보 포함
+    enhanced_prompt = f"""
+입력한 문장을 분석하여, 한국의 시/도 단위 지역과 시/군/구 단위 지역 그리고 동/읍/면 단위 지역을 각각 하나씩 선택하시오. 
+둘 중 하나라도 추출할 수 없다면 None을 출력하시오. 
+실제로 존재하지 않는 지역명은 반드시 None이라고 출력해야 함.
+
+현재 유효한 시/도명 목록:
+{', '.join(valid_provinces)}
+
+중요한 지역명 매핑 규칙:
+1. 문지동, 탑립동 → 대전광역시 유성구 (서울이 아님!)
+2. 판교동 → 경기도 성남시 분당구
+3. 역삼동, 삼성동, 청담동 → 서울특별시 강남구
+4. 강남역 주변 → 서울특별시 강남구 역삼동
+5. 홍대 → 서울특별시 마포구 서교동
+6. 명동 → 서울특별시 중구 명동
+7. 신촌 → 서울특별시 서대문구 창천동
+
+주의사항:
+1. 동명이 같더라도 반드시 문맥상 정확한 시/도와 시/군/구를 찾으세요.
+2. 대학명이나 특별한 랜드마크가 언급되면 해당 위치를 참고하세요:
+   - KAIST, 한국과학기술원 → 대전광역시 유성구
+   - 서울대학교 → 서울특별시 관악구
+   - 연세대학교 → 서울특별시 서대문구
+3. 위 목록에 없는 시도명이나 과거 행정구역명(예: 강원도→강원특별자치도, 전라북도→전북특별자치도)은 현재 명칭으로 변경하여 출력하세요.
+
+출력 포맷:{{format_instructions}}
+
+입력:{{query}}
+"""
+    
     response_schemas = [
-        ResponseSchema(name="province", description="시/도 단위 지역 (예: 서울특별시, 경기도, 부산광역시 등)", type="string"),
+        ResponseSchema(name="province", description="시/도 단위 지역 (예: 서울특별시, 경기도, 부산광역시 등) - 현재 유효한 명칭만 사용", type="string"),
         
-        ResponseSchema(name="city", description="시/군/구 단위 지역 (예: 강남구, 수원시, 해운대구 등)", type="string"),
+        ResponseSchema(name="city", description="시/군/구 단위 지역 (예: 강남구, 수원시, 해운대구 등) - 해당 시/도에 실제 존재하는 명칭만 사용", type="string"),
         
-        ResponseSchema(name="region", description="동/읍/면 단위 지역 (예: 역삼동, 장안면, 좌동 등)", type="string"),
+        ResponseSchema(name="region", description="동/읍/면 단위 지역 (예: 역삼동, 장안면, 좌동 등) - 해당 시/군/구에 실제 존재하는 명칭만 사용", type="string"),
     ]
     
     output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
@@ -84,8 +121,8 @@ def region_llm_chain():
     format_instructions = output_parser.get_format_instructions()
     
     prompt = PromptTemplate.from_template(
-        template = GET_PROVINCE_CITY_PROMPT,
-        partial_variables={"format_instructions": format_instructions, "categories": CATEGORIES},
+        template = enhanced_prompt,
+        partial_variables={"format_instructions": format_instructions},
     )
     
     model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -96,12 +133,52 @@ def region_llm_chain():
 
 def weather_area_llm_chain():
     
+    # 한국 지역 데이터 헬퍼 인스턴스 생성
+    regions_helper = korea_regions_helper()
+    
+    # 유효한 지역명 목록 가져오기
+    valid_provinces = regions_helper.get_valid_provinces()
+    
+    # 날씨 조회 전용 프롬프트 (더 상세한 가이드라인 포함)
+    weather_prompt = f"""
+입력한 문장에서 날씨 정보를 조회하고자 하는 한국의 지역을 정확히 추출하세요.
+시/도 단위 지역과 시/군/구 단위 지역 그리고 동/읍/면 단위 지역을 각각 하나씩 선택하시오. 
+추출할 수 없는 정보는 None을 출력하시오.
+실제로 존재하지 않는 지역명은 반드시 None이라고 출력해야 함.
+
+현재 유효한 시/도명 목록:
+{', '.join(valid_provinces)}
+
+중요한 지역명 매핑 규칙:
+1. 문지동, 탑립동 → 대전광역시 유성구 (서울이 아님!)
+2. 판교동 → 경기도 성남시 분당구
+3. 역삼동, 삼성동, 청담동 → 서울특별시 강남구
+4. 강남역 주변 → 서울특별시 강남구 역삼동
+5. 홍대 → 서울특별시 마포구 서교동
+6. 명동 → 서울특별시 중구 명동
+7. 신촌 → 서울특별시 서대문구 창천동
+
+주의사항:
+1. 동명이 같더라도 반드시 문맥상 정확한 시/도와 시/군/구를 찾으세요.
+2. 특별한 언급이 없으면 가장 일반적이고 알려진 지역으로 추정하되, 동명이 여러 곳에 있을 수 있으므로 주의하세요.
+3. 대학명이 언급되면 해당 대학 위치를 참고하세요:
+   - KAIST, 한국과학기술원 → 대전광역시 유성구
+   - 서울대학교 → 서울특별시 관악구
+   - 연세대학교 → 서울특별시 서대문구
+4. ⚠️ 중요: 지역이 전혀 명시되지 않은 경우 (예: "오늘 날씨 어때?", "내일 비와?", "날씨 알려줘") 
+   모든 필드를 None으로 출력하세요. 추정하지 마세요!
+
+출력 포맷:{{format_instructions}}
+
+입력:{{query}}
+"""
+    
     response_schemas = [
-        ResponseSchema(name="province", description="시/도 단위 지역 (예: 서울특별시, 경기도, 부산광역시 등)", type="string"),
+        ResponseSchema(name="province", description="시/도 단위 지역 (현재 유효한 법정 명칭만 사용)", type="string"),
         
-        ResponseSchema(name="city", description="시/군/구 단위 지역 (예: 강남구, 수원시, 해운대구 등)", type="string"),
+        ResponseSchema(name="city", description="시/군/구 단위 지역 (해당 시/도에 실제 존재하는 명칭만 사용)", type="string"),
         
-        ResponseSchema(name="region", description="동/읍/면 단위 지역 (예: 역삼동, 장안면, 좌동 등)", type="string"),
+        ResponseSchema(name="region", description="동/읍/면 단위 지역 (해당 시/군/구에 실제 존재하는 명칭만 사용)", type="string"),
     ]
     
     output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
@@ -109,8 +186,8 @@ def weather_area_llm_chain():
     format_instructions = output_parser.get_format_instructions()
     
     prompt = PromptTemplate.from_template(
-        template = GET_PROVINCE_CITY_PROMPT,
-        partial_variables={"format_instructions": format_instructions, "categories": CATEGORIES},
+        template = weather_prompt,
+        partial_variables={"format_instructions": format_instructions},
     )
     
     model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -323,18 +400,111 @@ class weather_forecast: # 일기 예보를 조회하는 툴
     def get_current_datetime(self):
         """
         현재 날짜와 시간을 'yyyyMMdd' 및 'HHMM' 형식으로 반환
+        기상청 API의 발표시간에 맞춰 조정
         
         Returns:
             tuple: (date_str, time_str)
         """
-        # 한국 표준시(KST, UTC+9)로 현재 시각을 얻고, 기준시는 2시간 전으로 설정
+        # 한국 표준시(KST, UTC+9)로 현재 시각을 얻음
         now = datetime.now(timezone(timedelta(hours=9)))
-        base_time = now - timedelta(hours=2)
         
-        date_str = now.strftime("%Y%m%d")
+        # 기상청 초단기예보 발표시간: 매시 30분에 발표 (1시간 후부터 6시간까지)
+        # API 호출가능 시간: 발표시간 + 10분 후 (매시 40분 이후)
+        
+        # 현재 시간이 40분 이전이면 이전 시간 기준으로 설정
+        if now.minute < 40:
+            base_time = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        else:
+            base_time = now.replace(minute=0, second=0, microsecond=0)
+        
+        # 혹시 모를 안전장치: 30분 전 시간 사용
+        base_time = base_time - timedelta(minutes=30)
+        
+        date_str = base_time.strftime("%Y%m%d")
         time_str = base_time.strftime("%H00")
-
+        
+        print(f"DEBUG: 현재시각={now.strftime('%Y-%m-%d %H:%M')}, 요청기준시각={base_time.strftime('%Y-%m-%d %H:%M')}")
+        
         return date_str, time_str
+    
+    def _retry_with_different_time(self, province, city, region, orig_date, orig_time, nx, ny, lat, lon):
+        """
+        NO_DATA 오류 시 다른 발표시간으로 재시도
+        """
+        print("INFO: 다른 발표시간으로 재시도 중...")
+        
+        # 현재 시간 기준으로 이전 몇 시간 시도
+        now = datetime.now(timezone(timedelta(hours=9)))
+        
+        retry_times = []
+        for hours_back in [1, 2, 3, 6]:
+            retry_time = now - timedelta(hours=hours_back)
+            retry_date = retry_time.strftime("%Y%m%d")
+            retry_hour = retry_time.strftime("%H00")
+            retry_times.append((retry_date, retry_hour))
+        
+        url = 'http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtFcst'
+        
+        for retry_date, retry_time in retry_times:
+            print(f"INFO: 재시도 - base_date={retry_date}, base_time={retry_time}")
+            
+            params = {
+                'serviceKey': os.getenv("WEATHER_API_KEY"),
+                'pageNo': '1', 
+                'numOfRows': '100', 
+                'dataType': 'JSON', 
+                'base_date': retry_date, 
+                'base_time': retry_time, 
+                'nx': str(int(nx)),
+                'ny': str(int(ny))
+            }
+            
+            try:
+                response = requests.get(url, params=params)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if (data.get("response", {}).get("header", {}).get("resultCode") == "00" and
+                        data.get("response", {}).get("body", {}).get("items", {}).get("item")):
+                        
+                        print(f"SUCCESS: {retry_date} {retry_time} 데이터로 성공!")
+                        items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
+                        
+                        # 날씨 데이터 처리 (기존 로직과 동일)
+                        weather_info = {}
+                        for item in items:
+                            category = item.get("category")
+                            fcstValue = item.get("fcstValue")
+                            fcstTime = item.get("fcstTime")
+                            
+                            if fcstTime not in weather_info:
+                                weather_info[fcstTime] = {}
+                            
+                            weather_info[fcstTime][category] = fcstValue
+                        
+                        weather_text = f"{province} {city} {region}의 {retry_date} {retry_time} 기준 날씨 예보\n\n"
+                        
+                        for fcstTime in sorted(weather_info.keys()):
+                            info = weather_info[fcstTime]
+                            weather_text += f"예보 시간: {fcstTime}시\n"
+                            weather_text += "------------------------------------------------------------------------\n"
+                            weather_text += f"- 기온(T1H): {info.get('T1H', 'N/A')} °C\n"
+                            weather_text += f"- 강수확률(POP): {info.get('POP', 'N/A')} %\n"
+                            weather_text += f"- 습도(REH): {info.get('REH', 'N/A')} %\n"
+                            weather_text += f"- 풍속(WS10): {info.get('WS10', info.get('WDSD', 'N/A'))} m/s\n"
+                            weather_text += f"- 하늘상태(SKY): {info.get('SKY', 'N/A')} (1: 맑음, 3: 구름많음, 4: 흐림)\n"
+                            weather_text += "------------------------------------------------------------------------\n\n"
+                        
+                        st.write(weather_text)
+                        return weather_text
+                        
+            except Exception as e:
+                print(f"재시도 실패 ({retry_date} {retry_time}): {e}")
+                continue
+        
+        # 모든 재시도 실패
+        return f"죄송해요, 현재 {province} {city} {region} 지역의 날씨 정보를 가져올 수 없어요. 잠시 후 다시 시도해주세요."
 
     def get_weather_forcast(self, province, city, region):  
         
@@ -395,14 +565,22 @@ class weather_forecast: # 일기 예보를 조회하는 툴
                 return
             
             if data.get("response", {}).get("header", {}).get("resultCode") != "00":
-                print(f"API 오류: {data.get('response', {}).get('header', {}).get('resultMsg')}")
-                return
+                error_code = data.get("response", {}).get("header", {}).get("resultCode")
+                error_msg = data.get("response", {}).get("header", {}).get("resultMsg")
+                print(f"API 오류: 코드={error_code}, 메시지={error_msg}")
+                
+                # NO_DATA 오류인 경우 다른 시간으로 재시도
+                if error_code == "03" or "NO_DATA" in str(error_msg):
+                    print("INFO: NO_DATA 오류 - 다른 발표시간으로 재시도합니다.")
+                    return self._retry_with_different_time(province, city, region, date_str, time_str, nx, ny, lat, lon)
+                
+                return f"날씨 정보 조회 실패: {error_msg}"
             
             items = data.get("response", {}).get("body", {}).get("items", {}).get("item", [])
             
             if not items:
-                print("예보 데이터가 없습니다.")
-                return
+                print("INFO: 예보 데이터가 없습니다 - 다른 시간으로 재시도합니다.")
+                return self._retry_with_different_time(province, city, region, date_str, time_str, nx, ny, lat, lon)
             
             # 필요한 정보 추출 및 출력
             weather_info = {}
@@ -437,10 +615,12 @@ class weather_forecast: # 일기 예보를 조회하는 툴
             return weather_text
 
         except requests.exceptions.RequestException as e:
-            st.error(f"네트워크 오류 또는 API 호출 실패: {e}")
+            print(f"네트워크 오류: {e}")
+            return f"죄송해요, 네트워크 문제로 날씨 정보를 가져올 수 없어요. 인터넷 연결을 확인하고 다시 시도해주세요."
             
         except Exception as e:
-            st.error(f"날씨 데이터를 처리하는 중 오류가 발생했습니다: {e}")
+            print(f"날씨 데이터 처리 오류: {e}")
+            return f"죄송해요, 날씨 데이터를 처리하는 중 문제가 발생했어요. 잠시 후 다시 시도해주세요."
 
 class place_recommand: # 맛집, 관광지 등의 맛집 추천 툴
     
@@ -541,6 +721,174 @@ class transport_infos: # 교통 정보 관련 추천 툴
     def get_transport_info(self, query):
         pass
 
+# """ Helper Classes """
+
+class korea_regions_helper:
+    """
+    한국 법정동 코드를 기반으로 정확한 지역명을 검증하고 추천하는 헬퍼 클래스
+    """
+    
+    def __init__(self):
+        self.regions_df = None
+        self.load_regions_data()
+    
+    def load_regions_data(self):
+        """korea_regions.csv 파일을 로드합니다."""
+        try:
+            filepath = os.path.join(os.path.dirname(__file__), "korea_regions.csv")
+            self.regions_df = pd.read_csv(filepath)
+            
+            # 빈 값들을 빈 문자열로 처리
+            self.regions_df = self.regions_df.fillna('')
+            
+            print("INFO: 한국 법정구역 데이터 로드 완료.")
+            print(f"INFO: 총 {len(self.regions_df)}개의 법정구역 데이터 로드됨.")
+            return True
+            
+        except Exception as e:
+            print(f"ERROR: 한국 법정구역 데이터 로드 실패: {e}")
+            return False
+    
+    def get_valid_provinces(self):
+        """유효한 시도명 목록을 반환합니다."""
+        if self.regions_df is None:
+            return []
+        
+        # 현재 사용되는 시도명만 추출 (과거 명칭 제외)
+        current_provinces = [
+            "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", 
+            "대전광역시", "울산광역시", "세종특별자치시", "경기도", "강원특별자치도", 
+            "충청북도", "충청남도", "전북특별자치도", "전라남도", "경상북도", 
+            "경상남도", "제주특별자치도"
+        ]
+        
+        return [p for p in current_provinces if p in self.regions_df['시도명'].values]
+    
+    def get_valid_cities_for_province(self, province):
+        """특정 시도에 속하는 유효한 시군구명 목록을 반환합니다."""
+        if self.regions_df is None or not province:
+            return []
+        
+        cities = self.regions_df[
+            (self.regions_df['시도명'] == province) & 
+            (self.regions_df['시군구명'] != '')
+        ]['시군구명'].unique().tolist()
+        
+        return sorted(cities)
+    
+    def get_valid_regions_for_city(self, province, city):
+        """특정 시도, 시군구에 속하는 유효한 읍면동명 목록을 반환합니다."""
+        if self.regions_df is None or not province or not city:
+            return []
+        
+        regions = self.regions_df[
+            (self.regions_df['시도명'] == province) & 
+            (self.regions_df['시군구명'] == city) & 
+            (self.regions_df['읍면동명'] != '')
+        ]['읍면동명'].unique().tolist()
+        
+        return sorted(regions)
+    
+    def validate_location(self, province=None, city=None, region=None):
+        """
+        입력된 지역명이 유효한지 검증하고, 가능한 대안을 제시합니다.
+        """
+        if self.regions_df is None:
+            return {"valid": False, "message": "지역 데이터를 로드할 수 없습니다."}
+        
+        result = {"valid": True, "corrections": {}, "suggestions": []}
+        
+        # 1. 시도 검증
+        valid_provinces = self.get_valid_provinces()
+        if province and province not in valid_provinces:
+            result["valid"] = False
+            result["corrections"]["province"] = f"'{province}'는 유효하지 않은 시도명입니다."
+            # 유사한 시도명 찾기 (개선된 매핑)
+            province_mappings = {
+                "강원도": "강원특별자치도",
+                "전라북도": "전북특별자치도", 
+                "전북도": "전북특별자치도",
+                "부산시": "부산광역시",
+                "대구시": "대구광역시", 
+                "인천시": "인천광역시",
+                "광주시": "광주광역시",
+                "대전시": "대전광역시", 
+                "울산시": "울산광역시"
+            }
+            
+            if province in province_mappings:
+                result["suggestions"].append(f"'{province}' → '{province_mappings[province]}'를 의미하시나요?")
+            else:
+                # 부분 일치 검색
+                for valid_province in valid_provinces:
+                    if province in valid_province or valid_province in province:
+                        result["suggestions"].append(f"'{province}' → '{valid_province}'를 의미하시나요?")
+                        break
+        
+        # 2. 시군구 검증 (시도가 유효한 경우에만)
+        if province and province in valid_provinces and city:
+            valid_cities = self.get_valid_cities_for_province(province)
+            if city not in valid_cities:
+                result["valid"] = False
+                result["corrections"]["city"] = f"'{city}'는 '{province}'에 없는 시군구명입니다."
+                # 유사한 시군구명 찾기
+                for valid_city in valid_cities:
+                    if city in valid_city or valid_city in city or self._similar_names(city, valid_city):
+                        result["suggestions"].append(f"'{city}' → '{valid_city}'를 의미하시나요?")
+                        break
+        
+        # 3. 읍면동 검증 (시도, 시군구가 유효한 경우에만)
+        if (province and province in valid_provinces and 
+            city and city in self.get_valid_cities_for_province(province) and 
+            region):
+            valid_regions = self.get_valid_regions_for_city(province, city)
+            if region not in valid_regions:
+                result["valid"] = False
+                result["corrections"]["region"] = f"'{region}'는 '{province} {city}'에 없는 읍면동명입니다."
+                
+                # 동명이 다른 지역에 있는지 확인
+                other_locations = self._find_region_in_other_locations(region)
+                if other_locations:
+                    result["suggestions"].append(f"'{region}'는 다음 지역에 있습니다: {', '.join(other_locations)}")
+                
+                # 유사한 읍면동명 찾기
+                for valid_region in valid_regions:
+                    if region in valid_region or valid_region in region or self._similar_names(region, valid_region):
+                        result["suggestions"].append(f"'{province} {city}'의 '{region}' → '{valid_region}'를 의미하시나요?")
+                        break
+        
+        return result
+    
+    def _find_region_in_other_locations(self, region_name):
+        """특정 동명이 다른 지역에 있는지 찾는 헬퍼 함수"""
+        if self.regions_df is None or not region_name:
+            return []
+        
+        matches = self.regions_df[self.regions_df['읍면동명'] == region_name]
+        locations = []
+        
+        for _, row in matches.iterrows():
+            location = f"{row['시도명']} {row['시군구명']}"
+            if location not in locations:
+                locations.append(location)
+        
+        return locations[:3]  # 최대 3개까지만 반환
+    
+    def _similar_names(self, name1, name2):
+        """두 지역명이 유사한지 검사하는 헬퍼 함수"""
+        if not name1 or not name2:
+            return False
+        
+        # 길이 차이가 2 이상이면 유사하지 않다고 판단
+        if abs(len(name1) - len(name2)) > 2:
+            return False
+        
+        # 공통 문자가 50% 이상이면 유사하다고 판단
+        common_chars = set(name1) & set(name2)
+        similarity = len(common_chars) / max(len(set(name1)), len(set(name2)))
+        
+        return similarity >= 0.5
+
 # """ Helper functions """
 def setup_env():
     
@@ -595,6 +943,9 @@ def define_session_state():
     if "region_chain" not in st.session_state:
         st.session_state["region_chain"] = region_llm_chain()
         
+    if "regions_helper" not in st.session_state:
+        st.session_state["regions_helper"] = korea_regions_helper()
+        
     if "weather_forecast_tool" not in st.session_state:
         st.session_state["weather_forecast_tool"] = weather_forecast()      
         
@@ -639,6 +990,14 @@ def main():
                 province = region_response.get('province')
                 city = region_response.get('city')
                 region = region_response.get('region')
+                
+                # 1.5. 지역명 유효성 검증 (경고만 표시, 검색은 계속 진행)
+                validation_result = st.session_state["regions_helper"].validate_location(
+                    province=province, city=city, region=region
+                )
+                
+                if not validation_result["valid"] and (province or city):
+                    print(f"WARNING: 맛집 검색 - 지역명 검증 실패: {validation_result}")
                 
                 # 2. 검색 쿼리 생성
                 location_text = f"{province} {city} {region}" if province or city or region else ""
@@ -719,6 +1078,14 @@ def main():
                 city = region_response.get('city')
                 region = region_response.get('region')
                 
+                # 1.5. 지역명 유효성 검증 (경고만 표시, 검색은 계속 진행)
+                validation_result = st.session_state["regions_helper"].validate_location(
+                    province=province, city=city, region=region
+                )
+                
+                if not validation_result["valid"] and (province or city):
+                    print(f"WARNING: 관광지 검색 - 지역명 검증 실패: {validation_result}")
+                
                 # 2. 검색 쿼리 생성
                 location_text = f"{province} {city} {region}" if province or city or region else ""
                 
@@ -778,22 +1145,67 @@ def main():
             # DATA KR 동네예보 서비스 API 활용
             elif response["category"] == CATEGORIES[2]: # 날씨
                 
-                response = st.session_state["weather_area"].invoke(
+                # 지역 추출
+                location_response = st.session_state["weather_area"].invoke(
                     {"query": user_input}
                 )
                 
-                context_weather = st.session_state["weather_forecast_tool"].get_weather_forcast(
-                    response['province'],
-                    response['city'],
-                    response['region'],
+                province = location_response.get('province')
+                city = location_response.get('city')
+                region = location_response.get('region')
+                
+                # 지역명 유효성 검증
+                validation_result = st.session_state["regions_helper"].validate_location(
+                    province=province, city=city, region=region
                 )
                 
-                response = st.session_state["chatbot_chain"].invoke({
-                        "context": f"다음은 {response['province']} {response['city']} {response['region']}의 날씨 정보입니다: \n\n 위 정보를 바탕으로 사용자의 질의에 친절하게 설명해줘",
-                        "user_input": user_input
-                })
+                # 지역이 전혀 명시되지 않은 경우 (모든 값이 None이거나 'None')
+                if (not province or province == 'None') and (not city or city == 'None') and (not region or region == 'None'):
+                    error_msg = """
+                    🗺️ 어느 지역의 날씨를 알고 싶으신가요?
+                    
+                    예시로 이렇게 물어보세요:
+                    • "서울 강남구 날씨 알려줘"
+                    • "대전 유성구 문지동 날씨는?"
+                    • "부산 해운대 날씨 어때?"
+                    • "제주도 날씨 궁금해"
+                    
+                    지역을 구체적으로 말씀해주시면 정확한 날씨 정보를 드릴게요! 😊
+                    """
+                    st.write(error_msg)
+                    print(f"INFO: 지역이 명시되지 않음 - province={province}, city={city}, region={region}")
+                    return
                 
-                st.write(response.content)
+                if not validation_result["valid"]:
+                    # 유효하지 않은 지역명인 경우 사용자에게 알림
+                    error_messages = []
+                    suggestions_text = ""
+                    
+                    for field, message in validation_result["corrections"].items():
+                        error_messages.append(message)
+                    
+                    if validation_result["suggestions"]:
+                        suggestions_text = "\n\n💡 혹시 이런 지역을 찾으시나요?\n" + "\n".join([f"• {s}" for s in validation_result["suggestions"]])
+                    
+                    error_msg = f"죄송해요, 입력해주신 지역 정보를 정확히 찾지 못했어요:\n\n" + "\n".join([f"• {msg}" for msg in error_messages]) + suggestions_text + "\n\n정확한 지역명(시도, 시군구, 동)을 다시 말씀해 주세요!"
+                    st.write(error_msg)
+                    print(f"INFO: 지역명 검증 실패 - {validation_result}")
+                else:
+                    # 유효한 지역명인 경우 날씨 조회 진행
+                    context_weather = st.session_state["weather_forecast_tool"].get_weather_forcast(
+                        province, city, region
+                    )
+                    
+                    if context_weather and not context_weather.startswith("날씨 조회 실패"):
+                        response = st.session_state["chatbot_chain"].invoke({
+                                "context": f"다음은 {province} {city} {region}의 날씨 정보입니다:\n\n{context_weather}\n\n위 정보를 바탕으로 사용자의 질의에 친절하게 설명해줘",
+                                "user_input": user_input
+                        })
+                        
+                        st.write(response.content)
+                    else:
+                        # 날씨 API 호출 실패
+                        st.write("죄송해요, 현재 날씨 정보를 가져올 수 없어요. 잠시 후 다시 시도해주세요.")
                  
             # OK!          
             elif response["category"] == CATEGORIES[3]: # 검색
