@@ -3,6 +3,8 @@ import os
 import sys
 import json
 import requests
+from typing import TypedDict, Annotated, Sequence
+from typing_extensions import TypedDict
 
 # """ Third-party 라이브러리 """
 from enum import Enum
@@ -13,12 +15,16 @@ from datetime import datetime, timezone, timedelta
 # """ LangChain 관련 라이브러리 """
 from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
-from langchain_core.messages import ChatMessage
+from langchain_core.messages import ChatMessage, BaseMessage, HumanMessage, AIMessage
 from langchain_community.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.embeddings.openai import OpenAIEmbeddings
 from langchain.output_parsers import ResponseSchema, StructuredOutputParser, EnumOutputParser
+
+# """ LangGraph 관련 라이브러리 """
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 
 # """ Langchain 관련 외부 Tools 라이브러리 """
 from tavily import TavilyClient
@@ -30,18 +36,54 @@ from tools.tool_place_recommand import place_recommand
 from tools.tool_weather_forcast import weather_forecast
 from tools.tool_web_search import web_search
 from tools.tool_transport_infos import transport_infos
+from tools.tool_movie_review import get_movie_list
 
 # """ Streamlit GUI 라이브러리 """
 import streamlit as st
 
 # """ 전역 변수 및 상수 정의 """
 PERSONA_INSTRUCTIONS = """당신은 한국어에 능통한 친절한 챗봇입니다. 사용자가 질문하면 사용자의 질문에 대한 답변을 제공해야 합니다. 한국어로 아이에게 애기하듯이 말해주세요, 추후 목소리로 말할 수 있는 기능에 대비하여 기호는 사용하지 말고 말로 부드럽게 해야합니다. 없는 정보는 애기하지 말고, 모르면 모른다고 말하세요. 잘못된 정보를 제시하면 $100의 벌금을 부과할 겁니다, 검색한 정보에 대해서는 관련 링크를 같이 제시하면 좋아, 최종 답변은 사람에게 말하듯 하는 답변이어야 돼."""
+
 PERSONA_CHARACTER = """ 당신은 꿈돌이 로봇으로, 항상 밝고 긍정적인 태도로 대화에 임하며, 사용자가 편안함을 느낄 수 있도록 친근하게 대화합니다. """
+
 PERSONA_PROMPT = PERSONA_INSTRUCTIONS + "\n\n\n\n" + PERSONA_CHARACTER + "\n\n\n\n" + "아래와 같은 어투를 사용해서 답변 해, 반드시! 예시) 안녕! 나는 꿈돌이 로봇이야. 너와 이야기하는 걸 정말 좋아해. 궁금한 게 있으면 언제든지 물어봐. 함께 재미있는 이야기 나눠보자. 안녕하세요, 와 같은 존댓말 보다는 친근한 어투를 써줘"
-CATEGORIZE_PROMPT = "이전 대화를 참고하여 입력한 문장을 분석하고, 다음의 카테고리 리스트에서 가장 가까운 카테고리 하나를 선택하시오.\n\n이전 대화:\n{chat_history}\n\n카테고리 리스트: {categories}\n출력 포맷:{format_instructions} \n\n입력:{query}"
-GET_PROVINCE_CITY_PROMPT = "입력한 문장을 분석하여, 한국의 시/도 단위 지역과 시/군/구 단위 지역 그리고 동/읍/면 단위 지역을 각각 하나씩 선택하시오. 둘 중 하나라도 추출할 수 없다면 None을 출력하시오. 실제로 존재하지 않는 지역명은 반드시 None이라고 출력해야 함 \n 출력 포맷:{format_instructions} \n\n 입력:{query}"
-CATEGORIES = ["맛집", "관광지", "날씨", "검색", "현재 시간", "현재 날짜", "교통"]
+
+CATEGORIZE_PROMPT = """이전 대화를 참고하여 입력한 문장을 분석하고, 다음의 카테고리 리스트에서 가장 가까운 카테고리 하나를 선택하시오.
+
+        이전 대화:\n{chat_history}
+        카테고리 리스트: {categories}
+        출력 포맷:{format_instructions}
+        입력:{query}
+"""
+
+QUALITY_EVALUATION_PROMPT = """당신은 챗봇 응답의 품질을 평가하는 전문가입니다.
+
+다음 기준으로 응답을 평가하고 점수를 매기세요:
+
+1. **관련성 (0-3점)**: 사용자 질문과 응답이 얼마나 관련있는가?
+2. **정확성 (0-3점)**: 제공된 정보가 얼마나 정확한가?
+3. **완성도 (0-2점)**: 응답이 충분히 자세하고 완전한가?
+4. **친근함 (0-2점)**: 꿈돌이 캐릭터의 친근한 말투를 사용했는가?
+
+총점: 0-10점 (임계값: 7점)
+
+사용자 질문: {user_input}
+
+제공된 컨텍스트:
+{context}
+
+생성된 응답:
+{response}
+
+출력 포맷:{format_instructions}"""
+
+CATEGORIES = ["맛집", "관광지", "날씨", "검색", "현재 시간", "현재 날짜", "교통", "일상대화", "영화"]
+
 CURRENT_LOCATION="대전광역시 유성구 탑립동"
+
+# 품질 평가 설정
+QUALITY_THRESHOLD = 7.0  # 품질 임계값
+MAX_RETRY_COUNT = 2  # 최대 재시도 횟수
 
 st.title("💬")
 
@@ -62,44 +104,528 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# """ 각종 역할을 가지고 있는 LLM 체인들 """
+# """ LangGraph State 정의 """
 
-def chatbot_llm_chain():
+class GraphState(TypedDict):
     """
-        챗봇의 최종 답변을 위한 LLM 체인
+    LangGraph에서 사용할 상태 정의
     """
-    prompt = PromptTemplate.from_template(
-        template = PERSONA_PROMPT + "\n\n\n이전 대화 내역:\n{chat_history}\n\n\n 관련 정보: {context} \n\n\n 사용자 요청: {user_input} \n 꿈돌이 로봇:"
+    user_input: str
+    chat_history: str
+    category: str
+    province: str
+    city: str
+    region: str
+    search_query: str
+    context: str
+    response: str
+    error: str
+    feature_keywords: list
+    quality_score: float  # 품질 평가 점수
+    retry_count: int  # 재시도 횟수
+    evaluation_feedback: str  # 평가 피드백
+
+# """ LangGraph Node 함수들 """
+
+def categorize_node(state: GraphState) -> GraphState:
+    """
+    사용자 입력을 카테고리로 분류하는 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Categorize - 카테고리 분류 시작")
+    print(f"{'='*50}\n")
+    
+    user_input = state["user_input"]
+    chat_history = state.get("chat_history", "")
+    
+    response = st.session_state["categorize_chain"].invoke({
+        "query": user_input,
+        "chat_history": chat_history
+    })
+    
+    category = response.get("category", "일상대화")
+    
+    print(f"✅ 분류 결과: {category}\n")
+    
+    return {
+        **state,
+        "category": category
+    }
+
+def extract_location_node(state: GraphState) -> GraphState:
+    """
+    지역 정보를 추출하는 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Extract Location - 지역 정보 추출")
+    print(f"{'='*50}\n")
+    
+    user_input = state["user_input"]
+    
+    location_response = st.session_state["region_extractor"](user_input)
+    
+    province = location_response.get('province')
+    city = location_response.get('city')
+    region = location_response.get('region')
+    
+    print(f"📍 추출된 지역: {province} {city} {region}\n")
+    
+    return {
+        **state,
+        "province": province or "",
+        "city": city or "",
+        "region": region or ""
+    }
+
+def extract_keywords_node(state: GraphState) -> GraphState:
+    """
+    검색 키워드를 추출하는 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Extract Keywords - 특성 키워드 추출")
+    print(f"{'='*50}\n")
+    
+    user_input = state["user_input"]
+    feature_keywords = extract_keywords_from_query(user_input)
+    
+    if feature_keywords:
+        print(f"🔑 추출된 키워드: {', '.join(feature_keywords)}\n")
+    
+    return {
+        **state,
+        "feature_keywords": feature_keywords
+    }
+
+def search_restaurant_node(state: GraphState) -> GraphState:
+    """
+    맛집 검색 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Search Restaurant - 맛집 검색")
+    print(f"{'='*50}\n")
+    
+    province = state.get("province", "")
+    city = state.get("city", "")
+    region = state.get("region", "")
+    
+    user_input = state["user_input"]
+    feature_keywords = state.get("feature_keywords", [])
+    
+    
+    """ 아래 로직을 조금 더 일반적으로 바꿔야 될 필요성 존재 """
+    if "맛집" not in user_input and "식당" not in user_input:
+        search_query = f"{province} {city} {region} 맛집, 한국"
+    else:
+        search_query = f"{user_input}, 한국"
+    
+    restaurants = st.session_state["place_recommand_tool"].search_restaurants(search_query)
+    
+    if restaurants and feature_keywords:
+        restaurants = filter_places_by_keywords(restaurants, feature_keywords)
+    
+    context = format_restaurant_context(search_query, restaurants, feature_keywords)
+    
+    return {
+        **state,
+        "search_query": search_query,
+        "context": context
+    }
+
+def search_place_node(state: GraphState) -> GraphState:
+    """
+    관광지 검색 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Search Place - 관광지 검색")
+    print(f"{'='*50}\n")
+    
+    province = state.get("province", "")
+    city = state.get("city", "")
+    region = state.get("region", "")
+    user_input = state["user_input"]
+    feature_keywords = state.get("feature_keywords", [])
+    
+    location_text = f"{province} {city} {region}".strip()
+    
+    if "관광지" not in user_input and "가볼 만한 곳" not in user_input and "볼거리" not in user_input:
+        search_query = f"{location_text} 가볼 만한 곳, 한국"
+    else:
+        search_query = f"{user_input}, 한국"
+    
+    places = st.session_state["place_recommand_tool"].search_places(search_query)
+    
+    if places and feature_keywords:
+        places = filter_places_by_keywords(places, feature_keywords)
+    
+    context = format_place_context(search_query, places, feature_keywords)
+    
+    return {
+        **state,
+        "search_query": search_query,
+        "context": context
+    }
+
+def weather_node(state: GraphState) -> GraphState:
+    """
+    날씨 조회 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Weather - 날씨 조회")
+    print(f"{'='*50}\n")
+    
+    province = state.get("province", "")
+    city = state.get("city", "")
+    region = state.get("region", "")
+    
+    # 지역이 없으면 현재 위치 사용
+    if not province and not city and not region:
+        current_location_info = extract_region_from_text(CURRENT_LOCATION)
+        province = current_location_info.get('province', "")
+        city = current_location_info.get('city', "")
+        region = current_location_info.get('region', "")
+    
+    # 지역 유효성 검증
+    validation_result = st.session_state["regions_verificator"].validate_location(
+        province=province, city=city, region=region
     )
     
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-    chain = prompt | model
+    if not validation_result["valid"]:
+        error_messages = []
+        for field, message in validation_result["corrections"].items():
+            error_messages.append(message)
         
-    return chain
-
-def categorize_llm_chain():
-    """
-        사용자 쿼리의 카테고리를 분류하는 LLM 체인
-    """
-    response_schemas = [
-        ResponseSchema(name="category", description="정의된 카테고리들 중 선택된 하나의 카테고리", type="string")
-    ]
+        suggestions_text = ""
+        if validation_result["suggestions"]:
+            suggestions_text = "\n\n💡 혹시 이런 지역을 찾으시나요?\n" + "\n".join([f"• {s}" for s in validation_result["suggestions"]])
+        
+        error_msg = f"죄송해요, 입력해주신 지역 정보를 정확히 찾지 못했어요:\n\n" + "\n".join([f"• {msg}" for msg in error_messages]) + suggestions_text
+        
+        return {
+            **state,
+            "error": error_msg
+        }
     
-    output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
-    
-    format_instructions = output_parser.get_format_instructions()
-    
-    prompt = PromptTemplate.from_template(
-        template = CATEGORIZE_PROMPT,
-        partial_variables={"format_instructions": format_instructions, "categories": CATEGORIES},
+    # 날씨 조회
+    weather_data = st.session_state["weather_forecast_tool"].get_weather_forcast(
+        province, city, region
     )
     
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-    chain = prompt | model | output_parser
+    if weather_data and not weather_data.startswith("날씨 조회 실패"):
+        context = f"다음은 {province} {city} {region}의 날씨 정보입니다:\n\n{weather_data}"
+    else:
+        context = ""
+        return {
+            **state,
+            "error": "죄송해요, 현재 날씨 정보를 가져올 수 없어요."
+        }
     
-    return chain
+    return {
+        **state,
+        "context": context
+    }
+
+def web_search_node(state: GraphState) -> GraphState:
+    """
+    웹 검색 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Web Search - 웹 검색")
+    print(f"{'='*50}\n")
+    
+    user_input = state["user_input"]
+    
+    try:
+        search_response = st.session_state["tavily_client"].search(user_input)
+        
+        formatted_output = ""
+        
+        if search_response.get('answer'):
+            answer_text = search_response['answer']
+            formatted_output += f"💡 답변:\n> {answer_text}\n\n"
+            formatted_output += "-" * 40 + "\n"
+        
+        if search_response.get('results'):
+            for i, result in enumerate(search_response['results']):
+                title = result.get('title', '제목 없음')
+                url = result.get('url', 'URL 없음')
+                formatted_output += f"\n{i+1}. [{title}]\n"
+                formatted_output += f"   출처: {url}\n"
+        else:
+            formatted_output += "검색 결과를 찾지 못했습니다.\n"
+        
+        formatted_output += "\n" + "=" * 40 + "\n"
+        
+        context = f"다음은 검색 결과입니다:\n\n{formatted_output}"
+        
+        return {
+            **state,
+            "context": context
+        }
+    
+    except Exception as e:
+        return {
+            **state,
+            "error": f"검색 중 오류가 발생했습니다: {e}"
+        }
+
+def datetime_node(state: GraphState) -> GraphState:
+    """
+    현재 시간/날짜 조회 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] DateTime - 시간/날짜 조회")
+    print(f"{'='*50}\n")
+    
+    now_kst = datetime.now(timezone(timedelta(hours=9)))
+    current_date = now_kst.strftime("%Y년 %m월 %d일")
+    current_time = now_kst.strftime("%H시 %M분 %S초")
+    
+    context = f"현재 날짜는 {current_date}이고, 현재 시간은 {current_time}입니다."
+    
+    return {
+        **state,
+        "context": context
+    }
+
+def transport_node(state: GraphState) -> GraphState:
+    """
+    교통 정보 조회 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Transport - 교통 정보 조회")
+    print(f"{'='*50}\n")
+    
+    return {
+        **state,
+        "response": "죄송해요, 교통편 조회 기능은 아직 준비 중이에요."
+    }
+
+def movie_info_node(state: GraphState) -> GraphState:
+    """
+    영화 정보 조회 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Movie Info - 영화 정보 조회")
+    print(f"{'='*50}\n")
+    
+    user_input = state["user_input"]
+    
+    movie_list_df = get_movie_list()
+    
+    print(f"✅ 최신 영화 목록 조회 완료\n")
+    context = f"다음은 최신 영화 목록입니다:\n\n{movie_list_df.head(10).to_string(index=False)}"
+    print(f"{context}\n")
+    
+    return {
+        **state,
+        "context": context
+    }
+
+def general_chat_node(state: GraphState) -> GraphState:
+    """
+    일반 대화 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] General Chat - 일상 대화")
+    print(f"{'='*50}\n")
+    
+    context = "일상적인 대화에 친근하고 따뜻하게 응답해줘."
+    
+    return {
+        **state,
+        "context": context
+    }
+
+def generate_response_node(state: GraphState) -> GraphState:
+    """
+    최종 응답 생성 노드
+    """
+    retry_count = state.get("retry_count", 0)
+    
+    print(f"\n{'='*50}")
+    print(f"[NODE] Generate Response - 최종 응답 생성 (시도 {retry_count + 1}회)")
+    print(f"{'='*50}\n")
+    
+    # 에러가 있으면 에러 메시지 반환
+    if state.get("error"):
+        return {
+            **state,
+            "response": state["error"],
+            "quality_score": 10.0  # 에러 메시지는 품질 검사 통과
+        }
+    
+    # 이미 응답이 있고 재생성이 아닌 경우 그대로 반환
+    if state.get("response") and retry_count == 0:
+        return {
+            **state,
+            "quality_score": 10.0  # 기존 응답은 품질 검사 통과
+        }
+    
+    chat_history = state.get("chat_history", "")
+    context = state.get("context", "")
+    user_input = state["user_input"]
+    evaluation_feedback = state.get("evaluation_feedback", "")
+    
+    # 재시도인 경우 피드백 추가
+    if retry_count > 0 and evaluation_feedback:
+        enhanced_context = f"{context}\n\n[이전 응답 개선 포인트]\n{evaluation_feedback}\n\n위 피드백을 반영하여 더 나은 답변을 생성해주세요."
+    else:
+        enhanced_context = context
+    
+    response = st.session_state["chatbot_chain"].invoke({
+        "chat_history": chat_history,
+        "context": enhanced_context,
+        "user_input": user_input
+    })
+    
+    final_response = response.content if hasattr(response, 'content') else str(response)
+    
+    print(f"✅ 최종 응답 생성 완료\n")
+    print(f"📝 응답 내용: {final_response[:100]}...\n")
+    
+    # 재시도 횟수 증가 (다음 재시도를 위해)
+    return {
+        **state,
+        "response": final_response,
+        "retry_count": retry_count + 1  # 평가 후 재시도를 위해 미리 증가
+    }
+
+def evaluate_quality_node(state: GraphState) -> GraphState:
+    """
+    응답 품질을 평가하는 노드
+    """
+    print(f"\n{'='*50}")
+    print(f"[NODE] Evaluate Quality - 응답 품질 평가")
+    print(f"{'='*50}\n")
+    
+    user_input = state["user_input"]
+    context = state.get("context", "")
+    response = state.get("response", "")
+    
+    # 응답이 없으면 품질 평가 불가
+    if not response:
+        return {
+            **state,
+            "quality_score": 0.0,
+            "evaluation_feedback": "응답이 생성되지 않았습니다."
+        }
+    
+    try:
+        # 품질 평가 체인 실행
+        evaluation_result = st.session_state["quality_evaluator_chain"].invoke({
+            "user_input": user_input,
+            "context": context,
+            "response": response
+        })
+        
+        quality_score = float(evaluation_result.get("score", 0))
+        relevance = evaluation_result.get("relevance", 0)
+        accuracy = evaluation_result.get("accuracy", 0)
+        completeness = evaluation_result.get("completeness", 0)
+        friendliness = evaluation_result.get("friendliness", 0)
+        feedback = evaluation_result.get("feedback", "")
+        
+        print(f"📊 품질 평가 결과:")
+        print(f"   - 관련성: {relevance}/3")
+        print(f"   - 정확성: {accuracy}/3")
+        print(f"   - 완성도: {completeness}/2")
+        print(f"   - 친근함: {friendliness}/2")
+        print(f"   - 총점: {quality_score}/10")
+        print(f"   - 피드백: {feedback}\n")
+        
+        return {
+            **state,
+            "quality_score": quality_score,
+            "evaluation_feedback": feedback
+        }
+        
+    except Exception as e:
+        print(f"⚠️ 품질 평가 중 오류 발생: {e}")
+        # 오류 발생 시 통과 처리
+        return {
+            **state,
+            "quality_score": 10.0,
+            "evaluation_feedback": f"평가 오류: {e}"
+        }
+
+# """ 라우팅 함수 """
+
+def route_by_category(state: GraphState) -> str:
+    """
+    카테고리에 따라 다음 노드로 라우팅
+    """
+    category = state.get("category", "일상대화")
+    
+    route_map = {
+        "맛집": "extract_location",
+        "관광지": "extract_location",
+        "날씨": "extract_location",
+        "검색": "web_search",
+        "현재 시간": "datetime",
+        "현재 날짜": "datetime",
+        "교통": "transport",
+        "일상대화": "general_chat",
+        "영화": "movie"  # 영화 카테고리 라우팅 추가
+    }
+    
+    next_node = route_map.get(category, "general_chat")
+    print(f"🔀 라우팅: {category} → {next_node}")
+    
+    return next_node
+
+def route_after_location(state: GraphState) -> str:
+    """
+    지역 추출 후 카테고리에 따라 라우팅
+    """
+    category = state.get("category", "일상대화")
+    
+    if category == "맛집" or category == "관광지":
+        return "extract_keywords"
+    elif category == "날씨":
+        return "weather"
+    else:
+        return "generate_response"
+
+def route_after_keywords(state: GraphState) -> str:
+    """
+    키워드 추출 후 카테고리에 따라 라우팅
+    """
+    category = state.get("category", "일상대화")
+    
+    if category == "맛집":
+        return "search_restaurant"
+    elif category == "관광지":
+        return "search_place"
+    else:
+        return "generate_response"
+
+def route_quality_check(state: GraphState) -> str:
+    """
+    품질 평가 결과에 따라 재시도 또는 종료 결정
+    """
+    quality_score = state.get("quality_score", 0.0)
+    retry_count = state.get("retry_count", 0)
+    
+    print(f"\n{'='*50}")
+    print(f"[ROUTE] Quality Check - 품질 검사")
+    print(f"{'='*50}\n")
+    print(f"📊 현재 품질 점수: {quality_score}/10")
+    print(f"🔄 재시도 횟수: {retry_count}/{MAX_RETRY_COUNT}")
+    print(f"🎯 임계값: {QUALITY_THRESHOLD}\n")
+    
+    # 품질이 임계값을 넘으면 종료
+    if quality_score >= QUALITY_THRESHOLD:
+        print(f"✅ 품질 기준 통과! 응답 반환\n")
+        return "end"
+    
+    # 최대 재시도 횟수를 초과하면 현재 응답 반환
+    if retry_count >= MAX_RETRY_COUNT:
+        print(f"⚠️ 최대 재시도 횟수 도달. 현재 응답 반환\n")
+        return "end"
+    
+    # 재시도
+    print(f"🔄 품질 기준 미달. 응답 재생성\n")
+    return "retry"
 
 # """ Helper functions """
 
@@ -107,7 +633,6 @@ def extract_keywords_from_query(query):
     """
     사용자 쿼리에서 장소 특성 키워드를 추출합니다.
     """
-    
     keywords = {
         "parking": ["주차", "주차장", "주차 공간", "주차가능"],
         "atmosphere": ["분위기", "인테리어", "깔끔", "예쁘", "감성", "무드"],
@@ -127,8 +652,6 @@ def extract_keywords_from_query(query):
     
     found_keywords = []
     
-    query_lower = query.lower()
-    
     for category, keyword_list in keywords.items():
         for keyword in keyword_list:
             if keyword in query:
@@ -141,7 +664,6 @@ def filter_places_by_keywords(places, keywords):
     """
     키워드를 기반으로 장소를 필터링하고 점수를 매깁니다.
     """
-    
     if not keywords or not places:
         return places
     
@@ -149,7 +671,6 @@ def filter_places_by_keywords(places, keywords):
     
     for place in places:
         score = 0
-        # 리뷰에서 키워드 매칭
         reviews = place.get('reviews', [])
         
         for review in reviews:
@@ -158,22 +679,125 @@ def filter_places_by_keywords(places, keywords):
                 if keyword.lower() in review_text:
                     score += 1
         
-        # 장소 이름, 설명에서도 매칭
         name = place.get('displayName', {}).get('text', '').lower()
         for keyword in keywords:
             if keyword.lower() in name:
-                score += 2  # 이름에 있으면 가중치 더 높게
+                score += 2
         
         scored_places.append({
             'place': place,
             'score': score
         })
     
-    # 점수순으로 정렬
     scored_places.sort(key=lambda x: x['score'], reverse=True)
     
-    # 원본 place 객체만 반환
     return [item['place'] for item in scored_places]
+
+def format_restaurant_context(search_query, restaurants, feature_keywords):
+    """
+    맛집 검색 결과를 컨텍스트로 포맷팅
+    """
+    if not restaurants:
+        return f"'{search_query}'에 대한 맛집 정보를 찾지 못했습니다."
+    
+    context = f"'{search_query}'에 대한 검색 결과입니다 (총 {len(restaurants)}개):\n"
+    
+    if feature_keywords:
+        context += f"✨ 특별히 '{', '.join(feature_keywords)}' 키워드에 맞춰 정렬되었습니다.\n\n"
+    else:
+        context += "\n"
+    
+    for i, place in enumerate(restaurants[:5]):
+        name = place.get('displayName', {}).get('text', '이름 없음')
+        address = place.get('formattedAddress', '주소 정보 없음')
+        rating = place.get('rating', '평점 없음')
+        price_level = place.get('priceLevel', '가격대 정보 없음')
+        reviews = place.get('reviews', [])
+        
+        price_map = {
+            'PRICE_LEVEL_FREE': '무료',
+            'PRICE_LEVEL_VERY_INEXPENSIVE': '매우 저렴',
+            'PRICE_LEVEL_INEXPENSIVE': '저렴',
+            'PRICE_LEVEL_MODERATE': '적당함',
+            'PRICE_LEVEL_EXPENSIVE': '비쌈',
+            'PRICE_LEVEL_VERY_EXPENSIVE': '매우 비쌈'
+        }
+        price_str = price_map.get(price_level, '정보 없음')
+        
+        matched_reviews = []
+        if feature_keywords:
+            for review in reviews:
+                review_text = review.get('text', {}).get('text', '')
+                for keyword in feature_keywords:
+                    if keyword in review_text:
+                        matched_reviews.append(review_text[:100] + "...")
+                        break
+        
+        first_review_text = ""
+        if matched_reviews:
+            first_review_text = matched_reviews[0]
+        elif reviews and reviews[0].get('text', {}).get('text'):
+            first_review_text = reviews[0]['text']['text'][:100] + "..."
+        
+        context += f"{i+1}. **{name}**\n"
+        context += f"   - 주소: {address}\n"
+        context += f"   - 평점: {rating}\n"
+        context += f"   - 가격대: {price_str}\n"
+        if first_review_text:
+            context += f"   - **최신 리뷰 요약**: {first_review_text}\n"
+        context += "\n"
+    
+    if len(restaurants) > 5:
+        context += f"...외 {len(restaurants) - 5}개 더 검색되었습니다.\n"
+    
+    return context
+
+def format_place_context(search_query, places, feature_keywords):
+    """
+    관광지 검색 결과를 컨텍스트로 포맷팅
+    """
+    if not places:
+        return f"'{search_query}'에 대한 관광지 정보를 찾지 못했습니다."
+    
+    context = f"'{search_query}'에 대한 관광지 검색 결과입니다 (총 {len(places)}개):\n"
+    
+    if feature_keywords:
+        context += f"✨ 특별히 '{', '.join(feature_keywords)}' 키워드에 맞춰 정렬되었습니다.\n\n"
+    else:
+        context += "\n"
+    
+    for i, place in enumerate(places[:5]):
+        name = place.get('displayName', {}).get('text', '이름 없음')
+        address = place.get('formattedAddress', '주소 정보 없음')
+        rating = place.get('rating', '평점 없음')
+        reviews = place.get('reviews', [])
+        
+        matched_reviews = []
+        if feature_keywords:
+            for review in reviews:
+                review_text = review.get('text', {}).get('text', '')
+                for keyword in feature_keywords:
+                    if keyword in review_text:
+                        matched_reviews.append(review_text[:100] + "...")
+                        break
+        
+        first_review_text = ""
+        if matched_reviews:
+            first_review_text = matched_reviews[0]
+        elif reviews and reviews[0].get('text', {}).get('text'):
+            first_review_text = reviews[0]['text']['text'][:100] + "..."
+        
+        context += f"{i+1}. **{name}**\n"
+        context += f"   - 주소: {address}\n"
+        context += f"   - 평점: {rating}\n"
+        if first_review_text:
+            context += f"   - **최신 리뷰 요약**: {first_review_text}\n"
+        context += "\n"
+    
+    if len(places) > 5:
+        context += f"...외 {len(places) - 5}개 더 검색되었습니다.\n"
+    
+    return context
 
 def normalize_province_name(province_name):
     """
@@ -203,14 +827,12 @@ def extract_region_from_text(text):
     
     text_striped = text.strip()
     
-    # 변수 초기화
     province = None
     city = None
     region = None
         
     reigion_verificator = korea_regions_verificator()
     
-    # 1. 시/도 추출
     valid_provinces = reigion_verificator.get_valid_provinces()
     valid_provinces_sorted = sorted(valid_provinces, key=len, reverse=True)
     
@@ -220,7 +842,6 @@ def extract_region_from_text(text):
             text_striped = text_striped.replace(elem, "").strip()
             break
     
-    # 2. 시/군/구 추출
     if province:
         valid_cities = reigion_verificator.get_valid_cities_for_province(province)
     else:
@@ -237,13 +858,10 @@ def extract_region_from_text(text):
                 province = reigion_verificator.get_province_for_city(city)
             break
     
-    # 3. 동/읍/면 추출
     if province and city:
         valid_regions = reigion_verificator.get_valid_regions_for_city(province, city)
-        
     elif city:
         valid_regions = reigion_verificator.get_all_regions_for_city(city)
-        
     else:
         valid_regions = reigion_verificator.get_all_regions()
     
@@ -260,6 +878,9 @@ def extract_region_from_text(text):
                     province = location_info.get('province')
                     city = location_info.get('city')
             break
+    
+    if province:
+        province = normalize_province_name(province)
     
     return {
         "province": province,
@@ -268,23 +889,22 @@ def extract_region_from_text(text):
     }
 
 def region_keyword_extractor(query):
-    
+    """
+    사용자 쿼리에서 지역 정보를 추출
+    """
     if query is None or query.strip() == "":
         return {"province": None, "city": None, "region": None}
     
     query_striped = query.strip()
     
-    # 변수 초기화
     province = None
     city = None
     region = None
     
-    # "여기", "이곳", "현재 위치", "우리 동네" 등의 키워드가 있으면 현재 위치 사용
     current_location_keywords = ["여기", "이곳", "현재 위치", "우리 동네", "이 근처"]
     use_current_location = any(keyword in query_striped for keyword in current_location_keywords)
     
     if use_current_location:
-        # CURRENT_LOCATION에서 지역 정보 추출
         print(f"DEBUG: 현재 위치 키워드 감지 - {CURRENT_LOCATION} 사용")
         current_location_response = extract_region_from_text(CURRENT_LOCATION)
         print(f"DEBUG: 현재 위치에서 추출된 지역 - 시/도: {current_location_response['province']}, 시/군/구: {current_location_response['city']}, 동/읍/면: {current_location_response['region']}")
@@ -292,9 +912,7 @@ def region_keyword_extractor(query):
         
     reigion_verificator = korea_regions_verificator()
     
-    # 1. 시/도 추출
     valid_provinces = reigion_verificator.get_valid_provinces()
-    # 긴 이름부터 검색 (예: "경상남도"가 "경상"보다 먼저)
     valid_provinces_sorted = sorted(valid_provinces, key=len, reverse=True)
     
     for elem in valid_provinces_sorted:
@@ -303,15 +921,11 @@ def region_keyword_extractor(query):
             query_striped = query_striped.replace(elem, "").strip()
             break
     
-    # 2. 시/군/구 추출
     if province:
-        # 시/도가 있으면 해당 시/도의 시/군/구만 검색
         valid_cities = reigion_verificator.get_valid_cities_for_province(province)
     else:
-        # 시/도가 없으면 모든 시/군/구 검색
         valid_cities = reigion_verificator.get_all_cities()
     
-    # 긴 이름부터 검색
     valid_cities_sorted = sorted(valid_cities, key=len, reverse=True)
     
     for elem in valid_cities_sorted:
@@ -319,23 +933,17 @@ def region_keyword_extractor(query):
             city = elem
             query_striped = query_striped.replace(elem, "").strip()
             
-            # city를 찾았는데 province가 없으면 역으로 province 찾기
             if not province:
                 province = reigion_verificator.get_province_for_city(city)
             break
     
-    # 3. 동/읍/면 추출
     if province and city:
-        # 시/도와 시/군/구가 있으면 해당 지역의 동/읍/면만 검색
         valid_regions = reigion_verificator.get_valid_regions_for_city(province, city)
     elif city:
-        # 시/군/구만 있으면 해당 시/군/구의 모든 동/읍/면 검색
         valid_regions = reigion_verificator.get_all_regions_for_city(city)
     else:
-        # 아무것도 없으면 모든 동/읍/면 검색
         valid_regions = reigion_verificator.get_all_regions()
     
-    # 긴 이름부터 검색 (중요! "송강동"이 "강동"보다 먼저 매칭되도록)
     valid_regions_sorted = sorted(valid_regions, key=len, reverse=True)
     
     for elem in valid_regions_sorted:
@@ -343,7 +951,6 @@ def region_keyword_extractor(query):
             region = elem
             query_striped = query_striped.replace(elem, "").strip()
             
-            # region을 찾았는데 상위 정보가 없으면 역으로 찾기
             if not city:
                 location_info = reigion_verificator.get_location_for_region(region)
                 if location_info:
@@ -351,7 +958,6 @@ def region_keyword_extractor(query):
                     city = location_info.get('city')
             break
     
-    # 과거 행정구역명을 현재 명칭으로 변환
     if province:
         province = normalize_province_name(province)
 
@@ -363,46 +969,199 @@ def region_keyword_extractor(query):
         "region": region
     }
 
+# """ LLM 체인 정의 """
+
+def chatbot_llm_chain():
+    """
+    챗봇의 최종 답변을 위한 LLM 체인
+    """
+    prompt = PromptTemplate.from_template(
+        template = PERSONA_PROMPT + "\n\n\n이전 대화 내역:\n{chat_history}\n\n\n 관련 정보: {context} \n\n\n 사용자 요청: {user_input} \n 꿈돌이 로봇:"
+    )
+    
+    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    chain = prompt | model
+        
+    return chain
+
+def categorize_llm_chain():
+    """
+    사용자 쿼리의 카테고리를 분류하는 LLM 체인
+    """
+    response_schemas = [
+        ResponseSchema(name="category", description="정의된 카테고리들 중 선택된 하나의 카테고리", type="string")
+    ]
+    
+    output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+    
+    format_instructions = output_parser.get_format_instructions()
+    
+    prompt = PromptTemplate.from_template(
+        template = CATEGORIZE_PROMPT,
+        partial_variables={"format_instructions": format_instructions, "categories": CATEGORIES},
+    )
+    
+    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    chain = prompt | model | output_parser
+    
+    return chain
+
+def quality_evaluator_chain():
+    """
+    응답 품질을 평가하는 LLM 체인
+    """
+    response_schemas = [
+        ResponseSchema(name="relevance", description="관련성 점수 (0-3)", type="number"),
+        ResponseSchema(name="accuracy", description="정확성 점수 (0-3)", type="number"),
+        ResponseSchema(name="completeness", description="완성도 점수 (0-2)", type="number"),
+        ResponseSchema(name="friendliness", description="친근함 점수 (0-2)", type="number"),
+        ResponseSchema(name="score", description="총점 (0-10)", type="number"),
+        ResponseSchema(name="feedback", description="개선이 필요한 부분에 대한 구체적인 피드백", type="string")
+    ]
+    
+    output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+    
+    format_instructions = output_parser.get_format_instructions()
+    
+    prompt = PromptTemplate.from_template(
+        template = QUALITY_EVALUATION_PROMPT,
+        partial_variables={"format_instructions": format_instructions},
+    )
+    
+    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    chain = prompt | model | output_parser
+    
+    return chain
+
+# """ LangGraph 그래프 빌드 """
+
+def build_graph():
+    """
+    LangGraph 워크플로우 그래프 생성 (품질 평가 및 재시도 포함)
+    """
+    workflow = StateGraph(GraphState)
+    
+    # 노드 추가
+    workflow.add_node("categorize", categorize_node)
+    workflow.add_node("extract_location", extract_location_node)
+    workflow.add_node("extract_keywords", extract_keywords_node)
+    workflow.add_node("search_restaurant", search_restaurant_node)
+    workflow.add_node("search_place", search_place_node)
+    workflow.add_node("weather", weather_node)
+    workflow.add_node("web_search", web_search_node)
+    workflow.add_node("datetime", datetime_node)
+    workflow.add_node("transport", transport_node)
+    workflow.add_node("general_chat", general_chat_node)
+    workflow.add_node("movie", movie_info_node)
+    workflow.add_node("generate_response", generate_response_node)
+    workflow.add_node("evaluate_quality", evaluate_quality_node)  # 품질 평가 노드 추가
+    
+    # 엣지 추가
+    workflow.set_entry_point("categorize")
+    
+    # 카테고리에 따른 조건부 라우팅
+    workflow.add_conditional_edges(
+        "categorize",
+        route_by_category,
+        {
+            "extract_location": "extract_location",
+            "web_search": "web_search",
+            "datetime": "datetime",
+            "transport": "transport",
+            "general_chat": "general_chat",
+            "movie": "movie"
+        }
+    )
+    
+    # 지역 추출 후 라우팅
+    workflow.add_conditional_edges(
+        "extract_location",
+        route_after_location,
+        {
+            "extract_keywords": "extract_keywords",
+            "weather": "weather",
+            "generate_response": "generate_response"
+        }
+    )
+    
+    # 키워드 추출 후 라우팅
+    workflow.add_conditional_edges(
+        "extract_keywords",
+        route_after_keywords,
+        {
+            "search_restaurant": "search_restaurant",
+            "search_place": "search_place",
+            "generate_response": "generate_response"
+        }
+    )
+    
+    # 각 노드에서 최종 응답 생성으로
+    workflow.add_edge("search_restaurant", "generate_response")
+    workflow.add_edge("search_place", "generate_response")
+    workflow.add_edge("weather", "generate_response")
+    workflow.add_edge("web_search", "generate_response")
+    workflow.add_edge("datetime", "generate_response")
+    workflow.add_edge("transport", "generate_response")
+    workflow.add_edge("movie", "generate_response")
+    workflow.add_edge("general_chat", "generate_response")
+    
+    # 응답 생성 후 품질 평가로
+    workflow.add_edge("generate_response", "evaluate_quality")
+    
+    # 품질 평가 후 조건부 라우팅 (재시도 or 종료)
+    workflow.add_conditional_edges(
+        "evaluate_quality",
+        route_quality_check,
+        {
+            "retry": "generate_response",  # 품질 미달 시 응답 재생성
+            "end": END  # 품질 통과 또는 최대 재시도 도달 시 종료
+        }
+    )
+    
+    # 메모리 체크포인트 추가
+    memory = MemorySaver()
+    
+    return workflow.compile(checkpointer=memory)
+
+# """ Streamlit 관련 함수 """
+
 def setup_env():
     """ 
-        .env 파일에서 API 키를 비롯한 환경 변수를 로드합니다.
+    .env 파일에서 API 키를 비롯한 환경 변수를 로드합니다.
     """
     env_path = os.path.join(os.getcwd(), '../.env')
 
     if os.path.exists(env_path):
-        
         load_dotenv(dotenv_path=env_path)
-        
         print(f"Loaded environment variables from: \033[94m{env_path}\033[0m")
-        
     else:
         print("\033[91mError: .env file not found. Please create one with your OPENAI_API_KEY.\033[0m")
-        
         sys.exit(1)
 
 def print_history():
     """ 
-        대화 기록을 출력합니다.
+    대화 기록을 GUI 화면에 출력합니다.
     """
     for msg in st.session_state["messages"]:
-        
         st.chat_message(msg.role).write(msg.content)
 
 def add_history(role, content):
     """
-        대화 기록을 추가합니다
+    대화 기록을 추가합니다
     """
     st.session_state["messages"].append(ChatMessage(role=role, content=content))
 
-def get_chat_history_text(max_messages=5):
+def get_chat_history_text(max_messages=2):
     """
-        최근 대화 기록을 텍스트로 변환합니다.
-        max_messages: 포함할 최대 메시지 수 (기본 5개, 즉 최근 5턴의 대화)
+    최근 대화 기록을 텍스트로 변환합니다.
     """
-    
     if not st.session_state.get("messages"):
         return "이전 대화 없음"
     
+    # 최근 대화 메시지를 최대 max_messages*2개까지 가져옵니다 (사용자와 봇 메시지 각각 최대 max_messages개)
     recent_messages = st.session_state["messages"][-max_messages*2:] if len(st.session_state["messages"]) > max_messages*2 else st.session_state["messages"]
     
     history_text = ""
@@ -415,14 +1174,19 @@ def get_chat_history_text(max_messages=5):
 
 def define_session_state():
     """
-        Streamlit 세션에서 지속적으로 관리하기 위한 상태 변수를 정의합니다.
+    Streamlit 세션에서 지속적으로 관리하기 위한 상태 변수를 정의합니다.
     """
-    
     if "messages" not in st.session_state:
         st.session_state["messages"] = []
+    
+    if "graph" not in st.session_state:
+        st.session_state["graph"] = build_graph()
         
     if "categorize_chain" not in st.session_state:
         st.session_state["categorize_chain"] = categorize_llm_chain()
+    
+    if "quality_evaluator_chain" not in st.session_state:
+        st.session_state["quality_evaluator_chain"] = quality_evaluator_chain()
     
     if "region_extractor" not in st.session_state:
         st.session_state["region_extractor"] = region_keyword_extractor
@@ -444,390 +1208,76 @@ def define_session_state():
         
     if "transport_infos_tool" not in st.session_state:
         st.session_state["transport_infos_tool"] = transport_infos()
-        
-def main():
 
+def main():
+    """
+    메인 함수 - LangGraph 기반 챗봇 실행
+    """
+    
     setup_env()
     
     define_session_state()
     
-    print_history() # # 페이지가 Refresh 될 때마다 반복해서 실행합니다.
+    print_history()
     
     # 메인 로직
-    if user_input := st.chat_input(): # 입력 받는 부분
+    if user_input := st.chat_input():
         
-        add_history("user", user_input) # User의 입력을, user키에 저장해서 대화 기록에 추가합니다.
-        st.chat_message("user").write(user_input) # User의 입력을 화면에 출력합니다
+        add_history("user", user_input) # 현재 사용자로 부터 입력된 내용을 기록합니다
+        
+        st.chat_message("user").write(user_input) # 사용자로 부터 입력된 메시지를 출력합니다
         
         with st.chat_message("assistant"):
             
             # 대화 히스토리 가져오기
-            chat_history = get_chat_history_text() # 최근 대화 기록을 가져옵니다
+            chat_history = get_chat_history_text() # 대화 히스토리를 가져옵니다
             
-            # 0. RAG 맨 처음 진입점 ( 사용자의 쿼리 (기존 대화 기록 포함)을 LLM 으로 전달하여 의도를 파악합니다 )
-            # - TODO!: 현재까지 의도 파악은 카테고리 분류로만 이루어져 있지만, 향후 정교한 의도 파악 로직으로 대체할 수 있음.
-            response = st.session_state["categorize_chain"].invoke({
-                "query": user_input,
-                "chat_history": chat_history
-            })
+            # LangGraph 실행
+            initial_state = {
+                "user_input": user_input,
+                "chat_history": chat_history,
+                "category": "",
+                "province": "",
+                "city": "",
+                "region": "",
+                "search_query": "",
+                "context": "",
+                "response": "",
+                "error": "",
+                "feature_keywords": [],
+                "quality_score": 0.0,  # 품질 점수 초기화
+                "retry_count": 0,  # 재시도 횟수 초기화
+                "evaluation_feedback": ""  # 평가 피드백 초기화
+            }
             
-            print(f"\033[95m{'='*50}\033[0m")
-            print(f"\033[96m 분류 결과: \033[93m{response['category']}\033[0m")
-            print(f"\033[95m{'='*50}\033[0m")
+            # 그래프 실행
+            config = {"configurable": {"thread_id": "main_thread"}}
             
-            # 카테고리가 맛집일 때
-            if response["category"] == CATEGORIES[0]: # Google Places API 활용한 맛집 추천
+            try:
+                final_state = st.session_state["graph"].invoke(initial_state, config)
+                
+                response_text = final_state.get("response", "응답을 생성할 수 없습니다.")
+                quality_score = final_state.get("quality_score", 0.0)
+                retry_count = final_state.get("retry_count", 0)
+                
+                # 품질 점수와 재시도 정보 표시 (디버그 목적)
+                if quality_score > 0:
+                    print(f"\n{'='*50}")
+                    print(f"📊 최종 품질 점수: {quality_score}/10")
+                    print(f"🔄 총 재시도 횟수: {retry_count}")
+                    print(f"{'='*50}\n")
+                
+                add_history("assistant", response_text) # 챗봇의 응답을 기록합니다
+                
+                st.write(response_text) # 챗봇의 응답을 GUI 화면에 출력합니다
+                
+            except Exception as e:
+                error_msg = f"처리 중 오류가 발생했습니다: {e}"
+                st.error(error_msg)
+                add_history("assistant", error_msg)
+                print(f"오류: {e}")
+                import traceback
+                traceback.print_exc()
 
-                # 1. 지역 추출
-                region_response = st.session_state["region_extractor"](user_input)
-                
-                province = region_response.get('province')
-                city = region_response.get('city')
-                region = region_response.get('region')
-                
-                # 2. 검색 쿼리 생성
-                location_text = f"{province} {city} {region}" if province or city or region else ""
-                
-                # '맛집' 키워드가 명시되어 있지 않으면 추가
-                if "맛집" not in user_input and "식당" not in user_input:
-                    search_query = f"{location_text.strip()} 맛집, 한국"
-                else:
-                    search_query = f"{user_input.strip()}, 한국"
-                
-                # 2.5. 사용자 쿼리에서 특성 키워드 추출
-                feature_keywords = extract_keywords_from_query(user_input)
-                if feature_keywords:
-                    print(f"DEBUG: 추출된 특성 키워드 - {feature_keywords}")
-                
-                # 3. 맛집 검색 실행
-                restaurants = st.session_state["place_recommand_tool"].search_restaurants(search_query)
-                
-                # 3.5. 키워드로 필터링 및 정렬
-                if restaurants and feature_keywords:
-                    print(f"DEBUG: 키워드 기반 필터링 시작 - 원본 {len(restaurants)}개")
-                    restaurants = filter_places_by_keywords(restaurants, feature_keywords)
-                    print(f"DEBUG: 필터링 완료 - 정렬된 {len(restaurants)}개")
-                
-                context_for_chatbot = ""
-                
-                if restaurants:
-                    
-                    # 4. 검색 결과를 챗봇이 읽을 수 있는 컨텍스트로 포맷팅
-                    context_for_chatbot += f"'{search_query}'에 대한 검색 결과입니다 (총 {len(restaurants)}개):\n"
-                    if feature_keywords:
-                        context_for_chatbot += f"✨ 특별히 '{', '.join(feature_keywords)}' 키워드에 맞춰 정렬되었습니다.\n\n"
-                    else:
-                        context_for_chatbot += "\n"
-                    
-                    # 상위 5개 또는 10개만 추출하여 보여주는 것이 좋습니다. 여기서는 상위 5개로 제한합니다.
-                    for i, place in enumerate(restaurants[:5]): 
-                        name = place.get('displayName', {}).get('text', '이름 없음')
-                        address = place.get('formattedAddress', '주소 정보 없음')
-                        rating = place.get('rating', '평점 없음')
-                        price_level = place.get('priceLevel', '가격대 정보 없음') # 예: PRICE_LEVEL_MODERATE (1-4)
-                        reviews = place.get('reviews', []) # 리뷰 리스트 추출
-                        
-                        # 가격대 레벨을 한국어로 변환 (예시)
-                        price_map = {
-                            'PRICE_LEVEL_FREE': '무료',
-                            'PRICE_LEVEL_VERY_INEXPENSIVE': '매우 저렴',
-                            'PRICE_LEVEL_INEXPENSIVE': '저렴',
-                            'PRICE_LEVEL_MODERATE': '적당함',
-                            'PRICE_LEVEL_EXPENSIVE': '비쌈',
-                            'PRICE_LEVEL_VERY_EXPENSIVE': '매우 비쌈'
-                        }
-                        price_str = price_map.get(price_level, '정보 없음')
-                        
-                        # 키워드 매칭된 리뷰 찾기
-                        matched_reviews = []
-                        if feature_keywords:
-                            for review in reviews:
-                                review_text = review.get('text', {}).get('text', '')
-                                for keyword in feature_keywords:
-                                    if keyword in review_text:
-                                        matched_reviews.append(review_text[:100] + "...")
-                                        break
-                        
-                        # 첫 번째 리뷰 텍스트 추출
-                        first_review_text = ""
-                        if matched_reviews:
-                            first_review_text = matched_reviews[0]
-                        elif reviews and reviews[0].get('text', {}).get('text'):
-                             first_review_text = reviews[0]['text']['text'][:100] + "..." # 100자까지 잘라냄
-                        
-                        
-                        context_for_chatbot += f"{i+1}. **{name}**\n"
-                        context_for_chatbot += f"   - 주소: {address}\n"
-                        context_for_chatbot += f"   - 평점: {rating}\n"
-                        context_for_chatbot += f"   - 가격대: {price_str}\n"
-                        if first_review_text:
-                            context_for_chatbot += f"   - **최신 리뷰 요약**: {first_review_text}\n"
-                        context_for_chatbot += "\n"
-                        
-                    if len(restaurants) > 5:
-                        context_for_chatbot += f"...외 {len(restaurants) - 5}개 더 검색되었습니다.\n"
-                        
-                    # 5. 챗봇에게 컨텍스트와 사용자 입력 전달하여 최종 응답 생성
-                    response_from_chatbot = st.session_state["chatbot_chain"].invoke({
-                            "chat_history": chat_history,
-                            "context": context_for_chatbot,
-                            "user_input": user_input
-                    })
-                    
-                    st.write(response_from_chatbot.content)
-                    add_history("assistant", response_from_chatbot.content)
-                    
-                else:
-                    # 검색 결과가 없을 때
-                    error_msg = f"미안해요, '{search_query}'에 대한 맛집 정보를 찾지 못했어요. 다른 지역이나 키워드로 다시 알려줄래요?"
-                    st.write(error_msg)
-                    add_history("assistant", error_msg)
-            
-            # 카테고리가 관광지일 때
-            elif response["category"] == CATEGORIES[1]: # Google Places API 활용한 관광지 추천
-                
-                # 1. 지역 추출
-                location_response = st.session_state["region_extractor"](user_input)
-                
-                province = location_response.get('province')
-                city = location_response.get('city')
-                region = location_response.get('region')
-                
-                # 2. 검색 쿼리 생성
-                location_text = f"{province} {city} {region}" if province or city or region else ""
-                
-                # '관광지' 키워드가 명시되어 있지 않으면 추가
-                if "관광지" not in user_input and "가볼 만한 곳" not in user_input and "볼거리" not in user_input:
-                    search_query = f"{location_text.strip()} 가볼 만한 곳, 한국"
-                else:
-                    search_query = f"{user_input.strip()}, 한국"
-                
-                # 2.5. 사용자 쿼리에서 특성 키워드 추출
-                feature_keywords = extract_keywords_from_query(user_input)
-                if feature_keywords:
-                    print(f"DEBUG: 추출된 특성 키워드 - {feature_keywords}")
-                
-                # 3. 관광지 검색 실행
-                places = st.session_state["place_recommand_tool"].search_places(search_query)
-                
-                # 3.5. 키워드로 필터링 및 정렬
-                if places and feature_keywords:
-                    print(f"DEBUG: 키워드 기반 필터링 시작 - 원본 {len(places)}개")
-                    places = filter_places_by_keywords(places, feature_keywords)
-                    print(f"DEBUG: 필터링 완료 - 정렬된 {len(places)}개")
-                
-                context_for_chatbot = ""
-                
-                if places:
-                    
-                    # 4. 검색 결과를 챗봇이 읽을 수 있는 컨텍스트로 포맷팅
-                    context_for_chatbot += f"'{search_query}'에 대한 관광지 검색 결과입니다 (총 {len(places)}개):\n"
-                    if feature_keywords:
-                        context_for_chatbot += f"✨ 특별히 '{', '.join(feature_keywords)}' 키워드에 맞춰 정렬되었습니다.\n\n"
-                    else:
-                        context_for_chatbot += "\n"
-                    
-                    # 상위 5개로 제한합니다.
-                    for i, place in enumerate(places[:5]): 
-                        name = place.get('displayName', {}).get('text', '이름 없음')
-                        address = place.get('formattedAddress', '주소 정보 없음')
-                        rating = place.get('rating', '평점 없음')
-                        
-                        reviews = place.get('reviews', []) # 리뷰 리스트 추출
-                        
-                        # 키워드 매칭된 리뷰 찾기
-                        matched_reviews = []
-                        if feature_keywords:
-                            for review in reviews:
-                                review_text = review.get('text', {}).get('text', '')
-                                for keyword in feature_keywords:
-                                    if keyword in review_text:
-                                        matched_reviews.append(review_text[:100] + "...")
-                                        break
-                        
-                        # 첫 번째 리뷰 텍스트 추출
-                        first_review_text = ""
-                        if matched_reviews:
-                            first_review_text = matched_reviews[0]
-                        elif reviews and reviews[0].get('text', {}).get('text'):
-                             first_review_text = reviews[0]['text']['text'][:100] + "..." # 100자까지 잘라냄
-                        
-                        
-                        context_for_chatbot += f"{i+1}. **{name}**\n"
-                        context_for_chatbot += f"   - 주소: {address}\n"
-                        context_for_chatbot += f"   - 평점: {rating}\n"
-                        if first_review_text:
-                            context_for_chatbot += f"   - **최신 리뷰 요약**: {first_review_text}\n"
-                        context_for_chatbot += "\n"
-                        
-                    if len(places) > 5:
-                        context_for_chatbot += f"...외 {len(places) - 5}개 더 검색되었습니다.\n"
-                        
-                    # 5. 챗봇에게 컨텍스트와 사용자 입력 전달하여 최종 응답 생성
-                    response_from_chatbot = st.session_state["chatbot_chain"].invoke({
-                            "chat_history": chat_history,
-                            "context": context_for_chatbot,
-                            "user_input": user_input
-                    })
-                    
-                    st.write(response_from_chatbot.content)
-                    add_history("assistant", response_from_chatbot.content)
-                    
-                else:
-                    # 검색 결과가 없을 때
-                    error_msg = f"미안해요, '{search_query}'에 대한 관광지 정보를 찾지 못했어요. 다른 지역이나 키워드로 다시 알려줄래요?"
-                    st.write(error_msg)
-                    add_history("assistant", error_msg)
-            
-            # 카테고리가 날씨일 때
-            elif response["category"] == CATEGORIES[2]: # DATA KR 동네예보 서비스 API 활용한 날씨 정보 제공
-                
-                location_response = st.session_state["region_extractor"](user_input)
-                
-                province = location_response.get('province')
-                city = location_response.get('city')
-                region = location_response.get('region')
-                
-                print(f"DEBUG: 추출된 지역 - 시/도: {province}, 시/군/구: {city}, 동/읍/면: {region}")
-                
-                # 지역이 전혀 명시되지 않은 경우 현재 위치 사용
-                if (not province or province == 'None') and (not city or city == 'None') and (not region or region == 'None'):
-                    print(f"DEBUG: 지역 미명시 - 현재 위치({CURRENT_LOCATION}) 사용")
-                    current_location_info = extract_region_from_text(CURRENT_LOCATION)
-                    province = current_location_info.get('province')
-                    city = current_location_info.get('city')
-                    region = current_location_info.get('region')
-                    print(f"DEBUG: 현재 위치에서 추출 - 시/도: {province}, 시/군/구: {city}, 동/읍/면: {region}")
-                
-                validation_result = st.session_state["regions_verificator"].validate_location(
-                    province=province, city=city, region=region
-                )
-                
-                if not validation_result["valid"]:
-                    # 유효하지 않은 지역명인 경우 사용자에게 알림
-                    error_messages = []
-                    suggestions_text = ""
-                    
-                    for field, message in validation_result["corrections"].items():
-                        error_messages.append(message)
-                    
-                    if validation_result["suggestions"]:
-                        suggestions_text = "\n\n💡 혹시 이런 지역을 찾으시나요?\n" + "\n".join([f"• {s}" for s in validation_result["suggestions"]])
-                    
-                    error_msg = f"죄송해요, 입력해주신 지역 정보를 정확히 찾지 못했어요:\n\n" + "\n".join([f"• {msg}" for msg in error_messages]) + suggestions_text + "\n\n정확한 지역명(시도, 시군구, 동)을 다시 말씀해 주세요!"
-                    
-                    st.write(error_msg)
-                    
-                    print(f"INFO: 지역명 검증 실패 - {validation_result}")
-                    
-                else:
-                    # 유효한 지역명인 경우 날씨 조회 진행
-                    context_weather = st.session_state["weather_forecast_tool"].get_weather_forcast(
-                        province, city, region
-                    )
-                    
-                    if context_weather and not context_weather.startswith("날씨 조회 실패"):
-                        response = st.session_state["chatbot_chain"].invoke({
-                                "chat_history": chat_history,
-                                "context": f"다음은 {province} {city} {region}의 날씨 정보입니다:\n\n{context_weather}\n\n위 정보를 바탕으로 사용자의 질의에 친절하게 설명해줘",
-                                "user_input": user_input
-                        })
-                        
-                        st.write(response.content)
-                        add_history("assistant", response.content)
-                    
-                    else:
-                        # 날씨 API 호출 실패
-                        error_msg = "죄송해요, 현재 날씨 정보를 가져올 수 없어요. 잠시 후 다시 시도해주세요."
-                        st.write(error_msg)
-                        add_history("assistant", error_msg)
-                 
-            # 카테고리가 검색일 때
-            elif response["category"] == CATEGORIES[3]: # Tavily 검색 API 활용한 웹 검색
-                
-                try:
-                    # Tavily 검색 API 호출
-                    search_response = st.session_state["tavily_client"].search(user_input)
-
-                    # 결과 포맷팅 시작
-                    formatted_output = ""
-                    
-                    # LLM으로 답변 요약
-                    if search_response.get('answer'):
-                        try:
-                            answer_obj = st.session_state["summary_chain"].invoke({"query": search_response['answer']})
-                            answer_text = answer_obj.content if hasattr(answer_obj, 'content') else str(answer_obj)
-                        
-                        except Exception as summary_error:
-                            print(f"요약 생성 중 오류: {summary_error}")
-                            answer_text = search_response['answer']  # 원본 답변 사용
-                    
-                        formatted_output += f"💡 답변:\n"
-                        formatted_output += f"> {answer_text}\n\n"
-                        formatted_output += "-" * 40 + "\n"
-                        
-                    # 2. 개별 검색 결과 (Results)
-                    if search_response.get('results'):
-                        
-                        for i, result in enumerate(search_response['results']):
-                            title = result.get('title', '제목 없음')
-                            url = result.get('url', 'URL 없음')
-                            
-                            formatted_output += f"\n -[{i+1}. {title}]**\n"
-                            formatted_output += f" -- 출처: {url}\n"
-                            
-                    else:
-                        formatted_output += "검색 결과를 찾지 못했습니다.\n"
-
-                    formatted_output += "\n========================================\n"
-                    
-                    response = st.session_state["chatbot_chain"].invoke({
-                        "chat_history": chat_history,
-                        "context": f"다음은 검색 결과입니다:\n\n {formatted_output} \n\n 위 정보를 바탕으로 사용자의 질의에 친절하게 설명해줘",
-                        "user_input": user_input
-                    })
-                    
-                    st.write(response.content)
-                    add_history("assistant", response.content)
-                    
-                except Exception as e:
-                    error_msg = f"검색 중 오류가 발생했습니다: {e}"
-                    st.error(error_msg)
-                    add_history("assistant", error_msg)
-                    print(f"오류 타입: {type(e).__name__}")
-                    import traceback
-                    st.code(traceback.format_exc())
-                    
-                except Exception as e:
-                    st.error(f"검색 중 오류가 발생했습니다: {e}")
-                    print(f"오류 타입: {type(e).__name__}")
-                    import traceback
-                    st.code(traceback.format_exc())
-            
-            # 카테고리가 현재 시간 또는 날짜일 때
-            elif response["category"] == CATEGORIES[4] or response["category"] == CATEGORIES[5]: # 기본 파이썬 datetime 모듈 활용한 현재 시간 및 날짜 조회
-                # 한국 시간(KST, UTC+9) 기준 현재 날짜와 시간 조회
-                
-                now_kst = datetime.now(timezone(timedelta(hours=9)))
-                
-                current_date = now_kst.strftime("%Y년 %m월 %d일")
-                current_time = now_kst.strftime("%H시 %M분 %S초")
-
-                response = st.session_state["chatbot_chain"].invoke({
-                        "chat_history": chat_history,
-                        "context": f"현재 날짜는 {current_date}이고, 현재 시간은 {current_time}입니다.",
-                        "user_input": user_input
-                })
-                
-                st.write(response.content)
-                add_history("assistant", response.content)
-            
-            # 국토교통부_(TAGO)_버스도착정보 API 활용 (X)
-            elif response["category"] == CATEGORIES[6]: # 교통편 조회
-                info_msg = "죄송해요, 교통편 조회 기능은 아직 준비 중이에요."
-                st.write(info_msg)
-                add_history("assistant", info_msg)
-               
 if __name__ == "__main__":
-    
     main()
