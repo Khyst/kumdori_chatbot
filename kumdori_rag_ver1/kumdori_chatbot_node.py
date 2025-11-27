@@ -65,6 +65,9 @@ st.markdown("""
 # """ 각종 역할을 가지고 있는 LLM 체인들 """
 
 def chatbot_llm_chain():
+    """
+        챗봇의 최종 답변을 위한 LLM 체인
+    """
     prompt = PromptTemplate.from_template(
         template = PERSONA_PROMPT + "\n\n\n이전 대화 내역:\n{chat_history}\n\n\n 관련 정보: {context} \n\n\n 사용자 요청: {user_input} \n 꿈돌이 로봇:"
     )
@@ -76,7 +79,9 @@ def chatbot_llm_chain():
     return chain
 
 def categorize_llm_chain():
-    
+    """
+        사용자 쿼리의 카테고리를 분류하는 LLM 체인
+    """
     response_schemas = [
         ResponseSchema(name="category", description="정의된 카테고리들 중 선택된 하나의 카테고리", type="string")
     ]
@@ -96,28 +101,13 @@ def categorize_llm_chain():
     
     return chain
 
-def summary_llm_chain():
-    prompt = PromptTemplate.from_template(
-        template = "다음 문단을 한국어로 아이에게 애기하듯이 요약해주세요: ~해요, ~어요 체를 써줘 \n\n{query}")
-    
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    
-    chain = prompt | model
-    
-    return chain
-
-def categorize_menu_llm(query):
-    
-    chain = categorize_llm_chain()
-    
-    return chain.invoke({"query": query})
-
 # """ Helper functions """
 
 def extract_keywords_from_query(query):
     """
     사용자 쿼리에서 장소 특성 키워드를 추출합니다.
     """
+    
     keywords = {
         "parking": ["주차", "주차장", "주차 공간", "주차가능"],
         "atmosphere": ["분위기", "인테리어", "깔끔", "예쁘", "감성", "무드"],
@@ -136,6 +126,7 @@ def extract_keywords_from_query(query):
     }
     
     found_keywords = []
+    
     query_lower = query.lower()
     
     for category, keyword_list in keywords.items():
@@ -150,6 +141,7 @@ def filter_places_by_keywords(places, keywords):
     """
     키워드를 기반으로 장소를 필터링하고 점수를 매깁니다.
     """
+    
     if not keywords or not places:
         return places
     
@@ -373,7 +365,7 @@ def region_keyword_extractor(query):
 
 def setup_env():
     """ 
-        .env 파일에서 환경 변수를 로드합니다.
+        .env 파일에서 API 키를 비롯한 환경 변수를 로드합니다.
     """
     env_path = os.path.join(os.getcwd(), '../.env')
 
@@ -407,6 +399,7 @@ def get_chat_history_text(max_messages=5):
         최근 대화 기록을 텍스트로 변환합니다.
         max_messages: 포함할 최대 메시지 수 (기본 5개, 즉 최근 5턴의 대화)
     """
+    
     if not st.session_state.get("messages"):
         return "이전 대화 없음"
     
@@ -422,7 +415,7 @@ def get_chat_history_text(max_messages=5):
 
 def define_session_state():
     """
-        세션 상태 변수를 정의합니다.
+        Streamlit 세션에서 지속적으로 관리하기 위한 상태 변수를 정의합니다.
     """
     
     if "messages" not in st.session_state:
@@ -436,9 +429,6 @@ def define_session_state():
         
     if "tavily_client" not in st.session_state:
         st.session_state["tavily_client"] = web_search()
-        
-    if "summary_chain" not in st.session_state:
-        st.session_state["summary_chain"] = summary_llm_chain()
         
     if "chatbot_chain" not in st.session_state:
         st.session_state["chatbot_chain"] = chatbot_llm_chain()
@@ -461,21 +451,21 @@ def main():
     
     define_session_state()
     
-    print_history()
+    print_history() # # 페이지가 Refresh 될 때마다 반복해서 실행합니다.
     
     # 메인 로직
     if user_input := st.chat_input(): # 입력 받는 부분
         
-        add_history("user", user_input)
-        
-        st.chat_message("user").write(user_input)
+        add_history("user", user_input) # User의 입력을, user키에 저장해서 대화 기록에 추가합니다.
+        st.chat_message("user").write(user_input) # User의 입력을 화면에 출력합니다
         
         with st.chat_message("assistant"):
             
             # 대화 히스토리 가져오기
-            chat_history = get_chat_history_text()
+            chat_history = get_chat_history_text() # 최근 대화 기록을 가져옵니다
             
-            # 0. 카테고리 추출 (히스토리 포함)
+            # 0. RAG 맨 처음 진입점 ( 사용자의 쿼리 (기존 대화 기록 포함)을 LLM 으로 전달하여 의도를 파악합니다 )
+            # - TODO!: 현재까지 의도 파악은 카테고리 분류로만 이루어져 있지만, 향후 정교한 의도 파악 로직으로 대체할 수 있음.
             response = st.session_state["categorize_chain"].invoke({
                 "query": user_input,
                 "chat_history": chat_history
@@ -485,8 +475,8 @@ def main():
             print(f"\033[96m 분류 결과: \033[93m{response['category']}\033[0m")
             print(f"\033[95m{'='*50}\033[0m")
             
-            # Google Places API 활용
-            if response["category"] == CATEGORIES[0]: # 맛집
+            # 카테고리가 맛집일 때
+            if response["category"] == CATEGORIES[0]: # Google Places API 활용한 맛집 추천
 
                 # 1. 지역 추출
                 region_response = st.session_state["region_extractor"](user_input)
@@ -593,8 +583,8 @@ def main():
                     st.write(error_msg)
                     add_history("assistant", error_msg)
             
-            # Google Places API 활용
-            elif response["category"] == CATEGORIES[1]: # 관광지
+            # 카테고리가 관광지일 때
+            elif response["category"] == CATEGORIES[1]: # Google Places API 활용한 관광지 추천
                 
                 # 1. 지역 추출
                 location_response = st.session_state["region_extractor"](user_input)
@@ -689,8 +679,8 @@ def main():
                     st.write(error_msg)
                     add_history("assistant", error_msg)
             
-            # DATA KR 동네예보 서비스 API 활용
-            elif response["category"] == CATEGORIES[2]: # 날씨
+            # 카테고리가 날씨일 때
+            elif response["category"] == CATEGORIES[2]: # DATA KR 동네예보 서비스 API 활용한 날씨 정보 제공
                 
                 location_response = st.session_state["region_extractor"](user_input)
                 
@@ -752,8 +742,8 @@ def main():
                         st.write(error_msg)
                         add_history("assistant", error_msg)
                  
-            # Tavily 검색 API 활용
-            elif response["category"] == CATEGORIES[3]: # 검색
+            # 카테고리가 검색일 때
+            elif response["category"] == CATEGORIES[3]: # Tavily 검색 API 활용한 웹 검색
                 
                 try:
                     # Tavily 검색 API 호출
@@ -814,8 +804,8 @@ def main():
                     import traceback
                     st.code(traceback.format_exc())
             
-            # 기본 파이썬 datetime 모듈 활용
-            elif response["category"] == CATEGORIES[4] or response["category"] == CATEGORIES[5]: # 현재 시간 또는 현재 날짜
+            # 카테고리가 현재 시간 또는 날짜일 때
+            elif response["category"] == CATEGORIES[4] or response["category"] == CATEGORIES[5]: # 기본 파이썬 datetime 모듈 활용한 현재 시간 및 날짜 조회
                 # 한국 시간(KST, UTC+9) 기준 현재 날짜와 시간 조회
                 
                 now_kst = datetime.now(timezone(timedelta(hours=9)))
